@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     bindings::xdp_action,
-    helpers::{bpf_get_smp_processor_id, bpf_map_lookup_percpu_elem},
+    helpers::{bpf_get_smp_processor_id, bpf_map_lookup_percpu_elem, bpf_ktime_get_ns},
     macros::{map, xdp},
     maps::{PerCpuArray, HashMap},
     programs::XdpContext,
@@ -12,6 +12,7 @@ use aya_log_ebpf::info;
 use core;
 use xdp_protection_common::{
     ExecutionError,
+    IpRecord
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -31,7 +32,7 @@ enum ActionType {
 static COUNTER: PerCpuArray<u32> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
-static IP_COUNTER: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+static IP_RECORDS: HashMap<u32, IpRecord> = HashMap::with_max_entries(1024, 0);
 
 const CPU_CORES: u32 = 4;
 const THRESHOLD_WARN: u32 = 20;    
@@ -42,12 +43,26 @@ const IP_WARN_LIMIT: u32 = 10;
 const IP_PARTIAL_LIMIT: u32 = 20; 
 const IP_BLOCK_LIMIT: u32 = 30; 
 
+const IP_EXPIRE_TIME_NS: u64 = 300_000_000_000;
+const BLOCK_EXPIRE_TIME_NS: u64 = 600_000_000_000; 
+
 #[xdp]
 pub fn xdp_protection(ctx: XdpContext) -> u32 {
     match try_xdp_protection(ctx) {
         Ok(ret) => ret,
         Err(_) => xdp_action::XDP_ABORTED,
     }
+}
+
+fn is_record_expired(record: &IpRecord, current_time: u64, is_blocked: bool) -> bool {
+    let expire_time = if is_blocked {
+        BLOCK_EXPIRE_TIME_NS
+    } else {
+        IP_EXPIRE_TIME_NS
+    };
+    
+    current_time > record.last_seen && 
+    current_time - record.last_seen > expire_time
 }
 
 #[inline(always)]
@@ -109,6 +124,7 @@ fn try_xdp_protection(ctx: XdpContext) -> Result<u32, ExecutionError> {
         let dst_port = u16::from_be_bytes((*udp_hdr).dest);
         let cpu = bpf_get_smp_processor_id();
         let total = get_total_cpu_counter();
+        let current_time = bpf_ktime_get_ns();
 
         if is_protected_service(src_port, dst_port) {
             info!(&ctx, "SERVICE: {:i}:{} -> {:i}:{}", 
@@ -125,11 +141,34 @@ fn try_xdp_protection(ctx: XdpContext) -> Result<u32, ExecutionError> {
             *counter
         };
 
-        let ip_count = {
-            let current_count = IP_COUNTER.get(&src_ip).copied().unwrap_or(0);
-            let new_count = current_count + 1;
-            let _ = IP_COUNTER.insert(&src_ip, &new_count, 0);
-            new_count
+        let (ip_count, was_blocked) = {
+            let existing_record = IP_RECORDS.get(&src_ip);
+            
+            match existing_record {
+                Some(record) => {
+                    let was_blocked = record.count >= IP_BLOCK_LIMIT;
+                    
+                    if is_record_expired(&record, current_time, was_blocked) {
+                        let new_record = IpRecord::new(1, current_time);
+                        let _ = IP_RECORDS.insert(&src_ip, &new_record, 0);
+                        info!(&ctx, "EXPIRED_RESET: {:i} count reset from {} to 1", 
+                            src_ip, record.count);
+                        (1, false)
+                    } else {
+                        let new_record = IpRecord::new(record.count + 1, current_time);
+                        let _ = IP_RECORDS.insert(&src_ip, &new_record, 0);
+                        (new_record.count, was_blocked)
+                    }
+                }
+                None => {
+                    let new_record = IpRecord {
+                        count: 1,
+                        last_seen: current_time,
+                    };
+                    let _ = IP_RECORDS.insert(&src_ip, &new_record, 0);
+                    (1, false)
+                }
+            }
         };
 
         let action = determine_action(total_packets, ip_count, src_ip, src_port, dst_port);
@@ -158,8 +197,13 @@ fn try_xdp_protection(ctx: XdpContext) -> Result<u32, ExecutionError> {
                 }
             }
             ActionType::Block => {
-                info!(&ctx, "BLOCK: {:i}:{} -> :{} (global:{}, ip:{})", 
-                    src_ip, src_port, dst_port, total_packets, ip_count);
+                if was_blocked {
+                    info!(&ctx, "STILL_BLOCKED: {:i}:{} -> :{} (global:{}, ip:{}) - continuing block", 
+                        src_ip, src_port, dst_port, total_packets, ip_count);
+                } else {
+                    info!(&ctx, "NEW_BLOCK: {:i}:{} -> :{} (global:{}, ip:{}) - first time blocked", 
+                        src_ip, src_port, dst_port, total_packets, ip_count);
+                }
                 Ok(xdp_action::XDP_DROP)
             }
         }
